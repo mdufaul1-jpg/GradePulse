@@ -8,7 +8,7 @@ from openai import OpenAI
 
 st.set_page_config(page_title="GradePulse", page_icon="📘", layout="wide")
 
-MODEL_NAME = "openai/gpt-5"
+MODEL_NAME = "openai/gpt-4.1"
 GITHUB_MODELS_ENDPOINT = "https://models.github.ai/inference"
 
 
@@ -73,10 +73,7 @@ def call_github_model(deliverable_text, requirements_text, target_grade):
             "top_improvements": [],
         }
 
-    client = OpenAI(
-        base_url=GITHUB_MODELS_ENDPOINT,
-        api_key=token,
-    )
+    client = OpenAI(base_url=GITHUB_MODELS_ENDPOINT, api_key=token)
 
     prompt = f"""
 You are GradePulse, a submission readiness evaluator.
@@ -122,27 +119,36 @@ Return ONLY valid JSON using this schema:
 }}
 """
 
-    response = client.chat.completions.create(
-       model="openai/gpt-5",
-        messages=[
-            {"role": "system", "content": "You are a careful evaluator that returns only valid JSON."},
-            {"role": "user", "content": prompt},
-        ],
-    )
-
-    raw_text = response.choices[0].message.content
-
     try:
+        response = client.chat.completions.create(
+            model=MODEL_NAME,
+            messages=[
+                {"role": "system", "content": "You are a careful evaluator that returns only valid JSON."},
+                {"role": "user", "content": prompt},
+            ],
+        )
+
+        raw_text = response.choices[0].message.content
         return json.loads(raw_text)
+
     except json.JSONDecodeError:
         return {
             "status": "Unable to Evaluate",
             "estimated_grade": None,
             "confidence": "Low",
-            "summary": "The model returned a response that was not valid JSON.",
+            "summary": "The model responded, but the response was not valid JSON.",
             "criteria": [],
             "top_improvements": [],
-            "raw_response": raw_text,
+        }
+
+    except Exception as e:
+        return {
+            "status": "Unable to Evaluate",
+            "estimated_grade": None,
+            "confidence": "Low",
+            "summary": f"Model connection error: {e}",
+            "criteria": [],
+            "top_improvements": [],
         }
 
 
@@ -235,10 +241,6 @@ if st.button("Evaluate Assignment"):
                 st.write(f"- Evidence found: {criterion.get('evidence_found', '')}")
                 st.write(f"- Assessment: {criterion.get('assessment', '')}")
                 st.write(f"- Score estimate: {criterion.get('score_estimate', '')}")
-
-        if "raw_response" in result:
-            with st.expander("Raw model response"):
-                st.write(result["raw_response"])
 
 st.divider()
 
