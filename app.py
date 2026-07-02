@@ -49,15 +49,30 @@ def check_evaluability(deliverable_text, requirements_text):
         issues.append("No readable completed assignment was provided.")
 
     if not requirements_text.strip():
-        issues.append("No readable assignment requirements were provided.")
+        issues.append("No readable assignment requirements, rubric, or guidance were provided.")
 
     if len(requirements_text.strip()) < 300:
-        issues.append("Assignment requirements appear too short to reliably identify expectations.")
+        issues.append("Uploaded guidance appears too short to reliably identify assignment expectations.")
 
     if len(deliverable_text.strip()) < 300:
         issues.append("Completed assignment appears too short to evaluate reliably.")
 
     return issues
+
+
+def soften_high_target_confidence(result, target_grade):
+    if (
+        target_grade >= 95
+        and result.get("status") == "Ready to Submit"
+        and result.get("confidence") == "High"
+    ):
+        result["confidence"] = "Moderate"
+        result["summary"] = (
+            result.get("summary", "")
+            + " Because the selected target is exceptionally high, this recommendation should be interpreted as submission readiness rather than a prediction of a perfect or near-perfect instructor score."
+        )
+
+    return result
 
 
 def call_github_model(deliverable_text, requirements_text, target_grade):
@@ -66,7 +81,6 @@ def call_github_model(deliverable_text, requirements_text, target_grade):
     if not token:
         return {
             "status": "Unable to Evaluate",
-            "estimated_grade": None,
             "confidence": "Low",
             "summary": "GitHub token is not set. The app cannot connect to GitHub Models.",
             "criteria": [],
@@ -76,20 +90,49 @@ def call_github_model(deliverable_text, requirements_text, target_grade):
     client = OpenAI(base_url=GITHUB_MODELS_ENDPOINT, api_key=token)
 
     prompt = f"""
-You are GradePulse, a submission readiness evaluator.
+You are GradePulse, a submission-readiness assistant.
 
-Core rules:
+Purpose:
+GradePulse helps students decide whether submitting an assignment is a reasonable decision for a user-selected target grade.
+GradePulse is NOT a grading tool and must NOT predict or display a numeric grade.
+
+Core philosophy:
+- GradePulse should reduce unnecessary editing.
+- GradePulse should catch meaningful omissions or weaknesses.
+- GradePulse should not encourage perfectionism or invent problems.
+- A submission can be ready to submit even if an instructor might still give feedback.
+
+Important behavior rules:
 - Do not invent missing assignment requirements.
-- Evaluate only against the uploaded assignment requirements, rubrics, and guidance.
-- If there is not enough information to evaluate reliably, return "Unable to Evaluate."
-- If estimated_grade >= target_grade and confidence is High, return "Ready to Submit."
-- If estimated_grade < target_grade and confidence is High, return "Revision Required."
-- If target is met, do not recommend edits.
-- If revision is required, provide exactly the top 3 specific improvements most likely to help the assignment reach the target.
+- Do not invent evidence from the completed assignment.
+- Evaluate only against the uploaded instructions, rubrics, and guidance.
+- If you cannot find evidence in the completed assignment, say "No supporting evidence found."
+- Do not use numeric estimated grades in your response.
+- Do not provide optional polish suggestions when the status is Ready to Submit.
 
-Target grade: {target_grade}
+Decision rules:
+Ready to Submit:
+- Return this when the uploaded assignment reasonably satisfies the uploaded grading criteria for the selected target.
+- Do not search for optional improvements simply because they could exist.
+- Do not require perfection.
 
-ASSIGNMENT REQUIREMENTS:
+Revision Required:
+- Return this only when meaningful deficiencies exist that make the selected target appear unreasonable.
+- The deficiencies should be significant enough that a reasonable instructor would likely deduct points.
+- Provide exactly three improvements.
+
+Unable to Evaluate:
+- Return this only when there is insufficient information to make a reliable readiness decision.
+
+Special guidance for high targets 95-100:
+- Apply a somewhat stricter review.
+- However, do NOT invent weaknesses simply because the target is high.
+- If the submission appears complete and reasonably satisfies the uploaded materials, it may still be Ready to Submit.
+- In those cases, confidence should usually be Moderate unless the evidence is exceptionally strong.
+
+Target grade selected by user: {target_grade}
+
+UPLOADED INSTRUCTIONS, RUBRICS, AND GUIDANCE:
 {requirements_text[:12000]}
 
 COMPLETED ASSIGNMENT:
@@ -98,22 +141,19 @@ COMPLETED ASSIGNMENT:
 Return ONLY valid JSON using this schema:
 {{
   "status": "Ready to Submit" | "Revision Required" | "Unable to Evaluate",
-  "estimated_grade": number or null,
   "confidence": "High" | "Medium" | "Low",
-  "summary": "brief explanation",
+  "summary": "brief explanation of the readiness decision",
   "criteria": [
     {{
-      "criterion": "name of criterion or requirement",
-      "evidence_found": "specific evidence from assignment or 'Not found'",
-      "assessment": "brief assessment",
-      "score_estimate": "points/percent/qualitative estimate if available"
+      "criterion": "name of requirement, rubric area, or expectation",
+      "evidence_found": "specific evidence from completed assignment or 'No supporting evidence found'",
+      "assessment": "brief assessment based only on uploaded materials"
     }}
   ],
   "top_improvements": [
     {{
       "improvement": "specific change",
-      "why_it_matters": "criterion or requirement affected",
-      "estimated_impact": "estimated point or grade impact"
+      "why_it_matters": "criterion or requirement affected"
     }}
   ]
 }}
@@ -123,18 +163,21 @@ Return ONLY valid JSON using this schema:
         response = client.chat.completions.create(
             model=MODEL_NAME,
             messages=[
-                {"role": "system", "content": "You are a careful evaluator that returns only valid JSON."},
+                {
+                    "role": "system",
+                    "content": "You are a careful evaluator. Return only valid JSON. Never invent evidence.",
+                },
                 {"role": "user", "content": prompt},
             ],
         )
 
         raw_text = response.choices[0].message.content
-        return json.loads(raw_text)
+        result = json.loads(raw_text)
+        return soften_high_target_confidence(result, target_grade)
 
     except json.JSONDecodeError:
         return {
             "status": "Unable to Evaluate",
-            "estimated_grade": None,
             "confidence": "Low",
             "summary": "The model responded, but the response was not valid JSON.",
             "criteria": [],
@@ -144,7 +187,6 @@ Return ONLY valid JSON using this schema:
     except Exception as e:
         return {
             "status": "Unable to Evaluate",
-            "estimated_grade": None,
             "confidence": "Low",
             "summary": f"Model connection error: {e}",
             "criteria": [],
@@ -157,7 +199,15 @@ st.subheader("Know when your assignment is ready to submit.")
 
 st.write(
     "Upload your completed assignment and any documents that define how it will be evaluated. "
-    "GradePulse checks whether your work appears ready to meet your target grade."
+    "GradePulse checks whether submitting now appears reasonable for your selected target."
+)
+
+st.info(
+    "GradePulse is intended for submission-readiness reassurance only. It cannot guarantee your project "
+    "will score at or above your target because instructors may use additional course content, expectations, "
+    "and professional judgment when applying a rubric. GradePulse compares your uploaded assignment against "
+    "the uploaded instructions, rubric, and guidance to determine whether your target grade appears to be a "
+    "reasonable outcome based on the information provided."
 )
 
 st.divider()
@@ -198,37 +248,37 @@ if st.button("Evaluate Assignment"):
 
     if issues:
         st.error("🔴 Unable to Evaluate")
-        st.write("GradePulse cannot confidently estimate a grade yet.")
+        st.write("GradePulse cannot confidently evaluate submission readiness yet.")
         for issue in issues:
             st.write(f"- {issue}")
 
     else:
-        with st.spinner("Evaluating with GitHub Models..."):
+        with st.spinner("Evaluating submission readiness with GitHub Models..."):
             result = call_github_model(deliverable_text, requirements_text, target_grade)
 
         status = result.get("status", "Unable to Evaluate")
-        estimated_grade = result.get("estimated_grade")
         confidence = result.get("confidence", "Low")
 
         if status == "Ready to Submit":
             st.success("🟢 Ready to Submit")
-            st.metric("Estimated Grade", estimated_grade)
             st.metric("Confidence", confidence)
-            st.write(result.get("summary", "Target appears to be met."))
+            st.write(result.get("summary", "The assignment appears ready to submit for the selected target."))
             st.subheader("No revisions recommended.")
 
         elif status == "Revision Required":
             st.warning("🟡 Revision Required")
-            st.metric("Estimated Grade", estimated_grade)
             st.metric("Target Grade", target_grade)
             st.metric("Confidence", confidence)
             st.write(result.get("summary", ""))
 
             st.subheader("Top 3 Improvements")
-            for item in result.get("top_improvements", []):
-                st.write(f"**{item.get('improvement', '')}**")
-                st.write(f"- Why it matters: {item.get('why_it_matters', '')}")
-                st.write(f"- Estimated impact: {item.get('estimated_impact', '')}")
+            improvements = result.get("top_improvements", [])
+            if improvements:
+                for item in improvements[:3]:
+                    st.write(f"**{item.get('improvement', '')}**")
+                    st.write(f"- Why it matters: {item.get('why_it_matters', '')}")
+            else:
+                st.write("No specific improvements were returned.")
 
         else:
             st.error("🔴 Unable to Evaluate")
@@ -236,15 +286,19 @@ if st.button("Evaluate Assignment"):
             st.write(result.get("summary", "Not enough information to evaluate reliably."))
 
         with st.expander("Criterion-by-criterion review"):
-            for criterion in result.get("criteria", []):
-                st.write(f"**{criterion.get('criterion', '')}**")
-                st.write(f"- Evidence found: {criterion.get('evidence_found', '')}")
-                st.write(f"- Assessment: {criterion.get('assessment', '')}")
-                st.write(f"- Score estimate: {criterion.get('score_estimate', '')}")
+            criteria = result.get("criteria", [])
+            if criteria:
+                for criterion in criteria:
+                    st.write(f"**{criterion.get('criterion', '')}**")
+                    st.write(f"- Evidence found: {criterion.get('evidence_found', '')}")
+                    st.write(f"- Assessment: {criterion.get('assessment', '')}")
+                    st.divider()
+            else:
+                st.write("No criterion review was returned.")
 
 st.divider()
 
 st.caption(
     "GradePulse constraint: the app only recommends revisions when it has enough information "
-    "to evaluate the work and the estimated grade is below the target."
+    "to evaluate the work and determines the selected target is not yet a reasonable outcome."
 )
