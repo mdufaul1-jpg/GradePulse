@@ -22,11 +22,9 @@ def extract_text_from_file(uploaded_file):
     try:
         if file_name.endswith(".txt"):
             return file_bytes.decode("utf-8", errors="ignore")
-
         if file_name.endswith(".docx"):
             doc = Document(io.BytesIO(file_bytes))
             return "\n".join([p.text for p in doc.paragraphs if p.text.strip()])
-
         if file_name.endswith(".pdf"):
             reader = PdfReader(io.BytesIO(file_bytes))
             text = []
@@ -35,7 +33,6 @@ def extract_text_from_file(uploaded_file):
                 if page_text:
                     text.append(page_text)
             return "\n".join(text)
-
     except Exception as e:
         return f"[Error reading file: {e}]"
 
@@ -47,17 +44,35 @@ def check_evaluability(deliverable_text, requirements_text):
 
     if not deliverable_text.strip():
         issues.append("No readable completed assignment was provided.")
-
     if not requirements_text.strip():
         issues.append("No readable assignment requirements, rubric, or guidance were provided.")
-
     if len(requirements_text.strip()) < 300:
         issues.append("Uploaded guidance appears too short to reliably identify assignment expectations.")
-
     if len(deliverable_text.strip()) < 300:
         issues.append("Completed assignment appears too short to evaluate reliably.")
 
     return issues
+
+
+def instructor_guidance(style):
+    if style == "Lenient":
+        return (
+            "Instructor grading style: Lenient. Only require revisions for clear, meaningful gaps. "
+            "Do not recommend revisions for minor polish, stylistic preference, or small ambiguities if the uploaded assignment substantially meets the criteria."
+        )
+    if style == "Average":
+        return (
+            "Instructor grading style: Average. Use a balanced review. Require revisions when rubric coverage is meaningfully incomplete, weak, or unclear."
+        )
+    if style == "Strict":
+        return (
+            "Instructor grading style: Strict. Require stronger, more explicit evidence before recommending Ready to Submit. "
+            "If a rubric area is only implied, thinly supported, or difficult to locate, treat that as a meaningful risk."
+        )
+    return (
+        "Instructor grading style: Unknown. Do not assume the instructor is lenient or strict. "
+        "Use the uploaded rubric and instructions as the primary standard."
+    )
 
 
 def clean_result(result, target_grade):
@@ -73,7 +88,6 @@ def clean_result(result, target_grade):
             result["top_improvements"] = improvements[:3]
 
         if len(improvements) < 3:
-            needed = 3 - len(improvements)
             filler = [
                 {
                     "improvement": "Add direct evidence that clearly addresses a missing or weak rubric requirement.",
@@ -88,18 +102,17 @@ def clean_result(result, target_grade):
                     "why_it_matters": "Direct alignment reduces ambiguity and makes the submission easier to evaluate."
                 },
             ]
-            result["top_improvements"] = improvements + filler[:needed]
+            result["top_improvements"] = improvements + filler[:3 - len(improvements)]
 
     if status == "Unable to Evaluate":
         result["top_improvements"] = []
 
-    # High-target caution without forcing unnecessary revisions
     if (
         target_grade >= 95
         and result.get("status") == "Ready to Submit"
         and result.get("confidence") == "High"
     ):
-        result["confidence"] = "Moderate"
+        result["confidence"] = "Medium"
         result["summary"] = (
             result.get("summary", "")
             + " Because the selected target is exceptionally high, this recommendation should be interpreted as submission readiness rather than a prediction of a perfect or near-perfect instructor score."
@@ -108,7 +121,7 @@ def clean_result(result, target_grade):
     return result
 
 
-def call_github_model(deliverable_text, requirements_text, target_grade):
+def call_github_model(deliverable_text, requirements_text, target_grade, grading_style):
     token = os.getenv("GITHUB_TOKEN")
 
     if not token:
@@ -121,6 +134,7 @@ def call_github_model(deliverable_text, requirements_text, target_grade):
         }
 
     client = OpenAI(base_url=GITHUB_MODELS_ENDPOINT, api_key=token)
+    style_guidance = instructor_guidance(grading_style)
 
     prompt = f"""
 You are GradePulse, an assignment submission-readiness evaluator.
@@ -135,6 +149,9 @@ Core philosophy:
 - GradePulse should not encourage perfectionism or invent problems.
 - A submission can be ready to submit even if an instructor might still give feedback.
 - This is a submission-readiness evaluation, not an editing service.
+
+Instructor context:
+{style_guidance}
 
 Evidence rules:
 - Evaluate ONLY against the uploaded assignment, instructions, rubrics, and guidance.
@@ -159,13 +176,13 @@ Confidence rules:
 
 Decision rules:
 Ready to Submit:
-- Return this when the uploaded assignment reasonably satisfies the uploaded grading criteria for the selected target.
+- Return this when the uploaded assignment reasonably satisfies the uploaded grading criteria for the selected target and instructor grading style.
 - Do not search for optional improvements simply because they could exist.
 - Do not require perfection.
 - If status is Ready to Submit, return ZERO improvements.
 
 Revision Required:
-- Return this when meaningful deficiencies, mismatches, or omissions make the selected target appear unreasonable.
+- Return this when meaningful deficiencies, mismatches, or omissions make the selected target appear unreasonable for the selected instructor grading style.
 - The deficiencies should be significant enough that a reasonable instructor would likely deduct points or question whether the target has been met.
 - Recommend revisions only if they would materially improve the likelihood of reaching the user's selected target.
 - If status is Revision Required, return EXACTLY THREE meaningful, high-impact improvements. No more and no fewer.
@@ -182,6 +199,7 @@ Special guidance for high targets 95-100:
 - In those cases, confidence should usually be Medium unless the evidence is exceptionally strong.
 
 Target grade selected by user: {target_grade}
+Instructor grading style selected by user: {grading_style}
 
 UPLOADED INSTRUCTIONS, RUBRICS, AND GUIDANCE:
 {requirements_text[:12000]}
@@ -219,8 +237,6 @@ Return ONLY valid JSON using this schema:
                     "content": """
 You are GradePulse, an assignment submission-readiness evaluator.
 
-Your job is to determine whether the uploaded assignment appears reasonably likely to meet the user's selected target based ONLY on the uploaded assignment instructions, rubric, and guidance.
-
 Rules:
 1. Never invent requirements, rubric criteria, assignment content, or evidence.
 2. Evidence must directly support the specific requirement being evaluated.
@@ -240,8 +256,7 @@ Rules:
             ],
         )
 
-        raw_text = response.choices[0].message.content
-        result = json.loads(raw_text)
+        result = json.loads(response.choices[0].message.content)
         return clean_result(result, target_grade)
 
     except json.JSONDecodeError:
@@ -289,6 +304,13 @@ target_grade = st.number_input(
     step=1,
 )
 
+grading_style = st.radio(
+    "Instructor grading style",
+    ["Unknown", "Lenient", "Average", "Strict"],
+    horizontal=True,
+    help="Use this only if you have a sense of how the instructor typically applies rubrics."
+)
+
 deliverable_file = st.file_uploader(
     "Upload completed assignment",
     type=["pdf", "docx", "txt"],
@@ -323,7 +345,12 @@ if st.button("Evaluate Assignment"):
 
     else:
         with st.spinner("Evaluating submission readiness with GitHub Models..."):
-            result = call_github_model(deliverable_text, requirements_text, target_grade)
+            result = call_github_model(
+                deliverable_text,
+                requirements_text,
+                target_grade,
+                grading_style
+            )
 
         status = result.get("status", "Unable to Evaluate")
         confidence = result.get("confidence", "Low")
@@ -337,6 +364,7 @@ if st.button("Evaluate Assignment"):
         elif status == "Revision Required":
             st.warning("🟡 Revision Required")
             st.metric("Target Grade", target_grade)
+            st.metric("Instructor Style", grading_style)
             st.metric("Confidence", confidence)
             st.write(result.get("summary", ""))
 
@@ -346,8 +374,6 @@ if st.button("Evaluate Assignment"):
                 for item in improvements[:3]:
                     st.write(f"**{item.get('improvement', '')}**")
                     st.write(f"- Why it matters: {item.get('why_it_matters', '')}")
-            else:
-                st.write("No specific improvements were returned.")
 
         else:
             st.error("🔴 Unable to Evaluate")
