@@ -60,7 +60,40 @@ def check_evaluability(deliverable_text, requirements_text):
     return issues
 
 
-def soften_high_target_confidence(result, target_grade):
+def clean_result(result, target_grade):
+    status = result.get("status", "Unable to Evaluate")
+
+    if status == "Ready to Submit":
+        result["top_improvements"] = []
+
+    if status == "Revision Required":
+        improvements = result.get("top_improvements", [])
+
+        if len(improvements) > 3:
+            result["top_improvements"] = improvements[:3]
+
+        if len(improvements) < 3:
+            needed = 3 - len(improvements)
+            filler = [
+                {
+                    "improvement": "Add direct evidence that clearly addresses a missing or weak rubric requirement.",
+                    "why_it_matters": "GradePulse should only count evidence when it directly supports the uploaded requirement."
+                },
+                {
+                    "improvement": "Revise the assignment so the main topic clearly matches the uploaded assignment instructions.",
+                    "why_it_matters": "A topic mismatch makes the selected target unlikely even if the writing is otherwise clear."
+                },
+                {
+                    "improvement": "Use explicit wording from the assignment instructions or rubric to show each requirement is addressed.",
+                    "why_it_matters": "Direct alignment reduces ambiguity and makes the submission easier to evaluate."
+                },
+            ]
+            result["top_improvements"] = improvements + filler[:needed]
+
+    if status == "Unable to Evaluate":
+        result["top_improvements"] = []
+
+    # High-target caution without forcing unnecessary revisions
     if (
         target_grade >= 95
         and result.get("status") == "Ready to Submit"
@@ -90,7 +123,7 @@ def call_github_model(deliverable_text, requirements_text, target_grade):
     client = OpenAI(base_url=GITHUB_MODELS_ENDPOINT, api_key=token)
 
     prompt = f"""
-You are GradePulse, a submission-readiness assistant.
+You are GradePulse, an assignment submission-readiness evaluator.
 
 Purpose:
 GradePulse helps students decide whether submitting an assignment is a reasonable decision for a user-selected target grade.
@@ -98,37 +131,55 @@ GradePulse is NOT a grading tool and must NOT predict or display a numeric grade
 
 Core philosophy:
 - GradePulse should reduce unnecessary editing.
-- GradePulse should catch meaningful omissions or weaknesses.
+- GradePulse should catch meaningful omissions, mismatches, or weaknesses.
 - GradePulse should not encourage perfectionism or invent problems.
 - A submission can be ready to submit even if an instructor might still give feedback.
+- This is a submission-readiness evaluation, not an editing service.
 
-Important behavior rules:
-- Do not invent missing assignment requirements.
-- Do not invent evidence from the completed assignment.
-- Evaluate only against the uploaded instructions, rubrics, and guidance.
-- If you cannot find evidence in the completed assignment, say "No supporting evidence found."
+Evidence rules:
+- Evaluate ONLY against the uploaded assignment, instructions, rubrics, and guidance.
+- Never invent assignment requirements, rubric criteria, or missing expectations.
+- Never invent evidence from the completed assignment.
+- Never assume a requirement is met unless the completed assignment directly supports it.
+- Do not count loosely related ideas as evidence.
+- Do not infer that a rubric criterion is partially satisfied from vaguely related concepts.
+- Evidence must be responsive to the specific rubric criterion or instruction being evaluated.
+- If evidence is related but not actually responsive to the requirement, say that clearly.
+- If evidence cannot be located, say "No supporting evidence found."
+- If evidence is incomplete or ambiguous, lower confidence instead of guessing.
+- Do not reward or penalize criteria that are not explicitly included in the uploaded rubric, instructions, or guidance.
 - Do not use numeric estimated grades in your response.
-- Do not provide optional polish suggestions when the status is Ready to Submit.
+
+Confidence rules:
+- Confidence means confidence in the readiness decision, not confidence in the final instructor grade.
+- Use High confidence when there is a clear match or clear mismatch between the assignment and the uploaded criteria.
+- Use Medium confidence when the decision depends on judgment, interpretation, quality, or borderline evidence.
+- Use Low confidence only when information is missing, unreadable, insufficient, conflicting, or too ambiguous to evaluate reliably.
+- A clearly wrong assignment matched to a clear rubric should usually be Revision Required with High confidence.
 
 Decision rules:
 Ready to Submit:
 - Return this when the uploaded assignment reasonably satisfies the uploaded grading criteria for the selected target.
 - Do not search for optional improvements simply because they could exist.
 - Do not require perfection.
+- If status is Ready to Submit, return ZERO improvements.
 
 Revision Required:
-- Return this only when meaningful deficiencies exist that make the selected target appear unreasonable.
-- The deficiencies should be significant enough that a reasonable instructor would likely deduct points.
-- Provide exactly three improvements.
+- Return this when meaningful deficiencies, mismatches, or omissions make the selected target appear unreasonable.
+- The deficiencies should be significant enough that a reasonable instructor would likely deduct points or question whether the target has been met.
+- Recommend revisions only if they would materially improve the likelihood of reaching the user's selected target.
+- If status is Revision Required, return EXACTLY THREE meaningful, high-impact improvements. No more and no fewer.
 
 Unable to Evaluate:
 - Return this only when there is insufficient information to make a reliable readiness decision.
+- Explain what information is missing.
+- If status is Unable to Evaluate, return ZERO improvements.
 
 Special guidance for high targets 95-100:
 - Apply a somewhat stricter review.
 - However, do NOT invent weaknesses simply because the target is high.
 - If the submission appears complete and reasonably satisfies the uploaded materials, it may still be Ready to Submit.
-- In those cases, confidence should usually be Moderate unless the evidence is exceptionally strong.
+- In those cases, confidence should usually be Medium unless the evidence is exceptionally strong.
 
 Target grade selected by user: {target_grade}
 
@@ -165,7 +216,25 @@ Return ONLY valid JSON using this schema:
             messages=[
                 {
                     "role": "system",
-                    "content": "You are a careful evaluator. Return only valid JSON. Never invent evidence.",
+                    "content": """
+You are GradePulse, an assignment submission-readiness evaluator.
+
+Your job is to determine whether the uploaded assignment appears reasonably likely to meet the user's selected target based ONLY on the uploaded assignment instructions, rubric, and guidance.
+
+Rules:
+1. Never invent requirements, rubric criteria, assignment content, or evidence.
+2. Evidence must directly support the specific requirement being evaluated.
+3. Do not treat loosely related content as partial evidence.
+4. If content is related but not responsive to the rubric, say it is not responsive.
+5. Confidence means confidence in your readiness decision, not confidence in the final instructor score.
+6. Clear match or clear mismatch = High confidence.
+7. Borderline quality judgment = Medium confidence.
+8. Missing, unreadable, conflicting, or insufficient information = Low confidence.
+9. Ready to Submit must return zero improvements.
+10. Revision Required must return exactly three improvements.
+11. Unable to Evaluate must return zero improvements and explain what is missing.
+12. Always return valid JSON that exactly matches the required schema.
+"""
                 },
                 {"role": "user", "content": prompt},
             ],
@@ -173,7 +242,7 @@ Return ONLY valid JSON using this schema:
 
         raw_text = response.choices[0].message.content
         result = json.loads(raw_text)
-        return soften_high_target_confidence(result, target_grade)
+        return clean_result(result, target_grade)
 
     except json.JSONDecodeError:
         return {
@@ -299,6 +368,5 @@ if st.button("Evaluate Assignment"):
 st.divider()
 
 st.caption(
-    "GradePulse constraint: the app only recommends revisions when it has enough information "
-    "to evaluate the work and determines the selected target is not yet a reasonable outcome."
+    "GradePulse constraint: Ready to Submit returns no improvements; Revision Required returns exactly three improvements; Unable to Evaluate explains what is missing."
 )
