@@ -5,11 +5,34 @@ import streamlit as st
 from docx import Document
 from pypdf import PdfReader
 from openai import OpenAI
+from grammar import review_grammar
 
 st.set_page_config(page_title="GradePulse", page_icon="📘", layout="wide")
 
 MODEL_NAME = "openai/gpt-4.1"
 GITHUB_MODELS_ENDPOINT = "https://models.github.ai/inference"
+
+
+def init_session_state():
+    defaults = {
+        "evaluation_result": None,
+        "grammar_result": None,
+        "deliverable_text": "",
+        "requirements_text": "",
+        "last_target_grade": None,
+        "last_grading_style": None,
+    }
+
+    for key, value in defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = value
+
+
+def reset_results():
+    st.session_state.evaluation_result = None
+    st.session_state.grammar_result = None
+    st.session_state.deliverable_text = ""
+    st.session_state.requirements_text = ""
 
 
 def extract_text_from_file(uploaded_file):
@@ -22,9 +45,11 @@ def extract_text_from_file(uploaded_file):
     try:
         if file_name.endswith(".txt"):
             return file_bytes.decode("utf-8", errors="ignore")
+
         if file_name.endswith(".docx"):
             doc = Document(io.BytesIO(file_bytes))
             return "\n".join([p.text for p in doc.paragraphs if p.text.strip()])
+
         if file_name.endswith(".pdf"):
             reader = PdfReader(io.BytesIO(file_bytes))
             text = []
@@ -33,6 +58,7 @@ def extract_text_from_file(uploaded_file):
                 if page_text:
                     text.append(page_text)
             return "\n".join(text)
+
     except Exception as e:
         return f"[Error reading file: {e}]"
 
@@ -44,10 +70,13 @@ def check_evaluability(deliverable_text, requirements_text):
 
     if not deliverable_text.strip():
         issues.append("No readable completed assignment was provided.")
+
     if not requirements_text.strip():
         issues.append("No readable assignment requirements, rubric, or guidance were provided.")
+
     if len(requirements_text.strip()) < 300:
         issues.append("Uploaded guidance appears too short to reliably identify assignment expectations.")
+
     if len(deliverable_text.strip()) < 300:
         issues.append("Completed assignment appears too short to evaluate reliably.")
 
@@ -58,17 +87,23 @@ def instructor_guidance(style):
     if style == "Lenient":
         return (
             "Instructor grading style: Lenient. Only require revisions for clear, meaningful gaps. "
-            "Do not recommend revisions for minor polish, stylistic preference, or small ambiguities if the uploaded assignment substantially meets the criteria."
+            "Do not recommend revisions for minor polish, stylistic preference, or small ambiguities "
+            "if the uploaded assignment substantially meets the criteria."
         )
+
     if style == "Average":
         return (
-            "Instructor grading style: Average. Use a balanced review. Require revisions when rubric coverage is meaningfully incomplete, weak, or unclear."
+            "Instructor grading style: Average. Use a balanced review. Require revisions when rubric "
+            "coverage is meaningfully incomplete, weak, or unclear."
         )
+
     if style == "Strict":
         return (
-            "Instructor grading style: Strict. Require stronger, more explicit evidence before recommending Ready to Submit. "
-            "If a rubric area is only implied, thinly supported, or difficult to locate, treat that as a meaningful risk."
+            "Instructor grading style: Strict. Require stronger, more explicit evidence before recommending "
+            "Ready to Submit. If a rubric area is only implied, thinly supported, or difficult to locate, "
+            "treat that as a meaningful risk."
         )
+
     return (
         "Instructor grading style: Unknown. Do not assume the instructor is lenient or strict. "
         "Use the uploaded rubric and instructions as the primary standard."
@@ -81,7 +116,7 @@ def clean_result(result, target_grade):
     if status == "Ready to Submit":
         result["top_improvements"] = []
 
-    if status == "Revision Required":
+    elif status == "Revision Required":
         improvements = result.get("top_improvements", [])
 
         if len(improvements) > 3:
@@ -104,7 +139,7 @@ def clean_result(result, target_grade):
             ]
             result["top_improvements"] = improvements + filler[:3 - len(improvements)]
 
-    if status == "Unable to Evaluate":
+    else:
         result["top_improvements"] = []
 
     if (
@@ -115,7 +150,8 @@ def clean_result(result, target_grade):
         result["confidence"] = "Medium"
         result["summary"] = (
             result.get("summary", "")
-            + " Because the selected target is exceptionally high, this recommendation should be interpreted as submission readiness rather than a prediction of a perfect or near-perfect instructor score."
+            + " Because the selected target is exceptionally high, this recommendation should be interpreted "
+            "as submission readiness rather than a prediction of a perfect or near-perfect instructor score."
         )
 
     return result
@@ -227,7 +263,6 @@ Return ONLY valid JSON using this schema:
   ]
 }}
 """
-
     try:
         response = client.chat.completions.create(
             model=MODEL_NAME,
@@ -278,6 +313,129 @@ Rules:
         }
 
 
+def get_client():
+    token = os.getenv("GITHUB_TOKEN")
+    if not token:
+        return None
+
+    return OpenAI(
+        base_url=GITHUB_MODELS_ENDPOINT,
+        api_key=token,
+    )
+
+
+def render_ready_to_submit(result):
+    confidence = result.get("confidence", "Low")
+
+    st.success("🟢 Ready to Submit")
+    st.metric("Confidence", confidence)
+    st.write(result.get("summary", "The assignment appears ready to submit for the selected target."))
+    st.subheader("No revisions recommended.")
+
+    st.divider()
+
+    st.subheader("Optional Grammar & Style Review")
+
+    st.write(
+        "Your assignment appears ready to submit. If you'd like, GradePulse can perform an optional review "
+        "for grammar, clarity, punctuation, and writing flow. These suggestions are optional and are NOT "
+        "considered necessary to meet your selected target."
+    )
+
+    if st.button("Review Grammar & Style"):
+        client = get_client()
+
+        if client is None:
+            st.session_state.grammar_result = {
+                "suggestions": [
+                    {
+                        "issue": "Grammar review unavailable",
+                        "suggestion": "GitHub token is not set. The app cannot connect to GitHub Models."
+                    }
+                ]
+            }
+        else:
+            with st.spinner("Reviewing writing mechanics..."):
+                st.session_state.grammar_result = review_grammar(
+                    client,
+                    st.session_state.deliverable_text,
+                )
+
+    if st.session_state.grammar_result:
+        suggestions = st.session_state.grammar_result.get("suggestions", [])
+
+        if suggestions:
+            st.subheader("Writing Suggestions")
+            for i, suggestion in enumerate(suggestions, start=1):
+                st.write(f"**{i}. {suggestion.get('issue', '')}**")
+                st.write(suggestion.get("suggestion", ""))
+        else:
+            st.success("No writing suggestions were identified.")
+
+
+def render_revision_required(result, target_grade, grading_style):
+    confidence = result.get("confidence", "Low")
+
+    st.warning("🟡 Revision Required")
+    st.metric("Target Grade", target_grade)
+    st.metric("Instructor Style", grading_style)
+    st.metric("Confidence", confidence)
+    st.write(result.get("summary", ""))
+
+    st.subheader("Top 3 Improvements")
+    improvements = result.get("top_improvements", [])
+
+    for item in improvements[:3]:
+        st.write(f"**{item.get('improvement', '')}**")
+        st.write(f"- Why it matters: {item.get('why_it_matters', '')}")
+
+
+def render_unable_to_evaluate(result):
+    confidence = result.get("confidence", "Low")
+
+    st.error("🔴 Unable to Evaluate")
+    st.metric("Confidence", confidence)
+    st.write(result.get("summary", "Not enough information to evaluate reliably."))
+
+
+def render_criterion_review(result):
+    with st.expander("Criterion-by-criterion review"):
+        criteria = result.get("criteria", [])
+
+        if criteria:
+            for criterion in criteria:
+                st.write(f"**{criterion.get('criterion', '')}**")
+                st.write(f"- Evidence found: {criterion.get('evidence_found', '')}")
+                st.write(f"- Assessment: {criterion.get('assessment', '')}")
+                st.divider()
+        else:
+            st.write("No criterion review was returned.")
+
+
+def render_results(target_grade, grading_style):
+    result = st.session_state.evaluation_result
+
+    if not result:
+        return
+
+    st.divider()
+
+    status = result.get("status", "Unable to Evaluate")
+
+    if status == "Ready to Submit":
+        render_ready_to_submit(result)
+
+    elif status == "Revision Required":
+        render_revision_required(result, target_grade, grading_style)
+
+    else:
+        render_unable_to_evaluate(result)
+
+    render_criterion_review(result)
+
+
+init_session_state()
+
 st.title("📘 GradePulse")
 st.subheader("Know when your assignment is ready to submit.")
 
@@ -308,7 +466,7 @@ grading_style = st.radio(
     "Instructor grading style",
     ["Unknown", "Lenient", "Average", "Strict"],
     horizontal=True,
-    help="Use this only if you have a sense of how the instructor typically applies rubrics."
+    help="Use this only if you have a sense of how the instructor typically applies rubrics.",
 )
 
 deliverable_file = st.file_uploader(
@@ -323,7 +481,20 @@ requirements_files = st.file_uploader(
     accept_multiple_files=True,
 )
 
+inputs_changed = (
+    st.session_state.last_target_grade != target_grade
+    or st.session_state.last_grading_style != grading_style
+)
+
+if inputs_changed:
+    st.session_state.last_target_grade = target_grade
+    st.session_state.last_grading_style = grading_style
+    st.session_state.evaluation_result = None
+    st.session_state.grammar_result = None
+
 if st.button("Evaluate Assignment"):
+    st.session_state.grammar_result = None
+
     deliverable_text = extract_text_from_file(deliverable_file)
 
     requirements_texts = []
@@ -333,63 +504,30 @@ if st.button("Evaluate Assignment"):
 
     requirements_text = "\n\n".join(requirements_texts)
 
-    st.divider()
+    st.session_state.deliverable_text = deliverable_text
+    st.session_state.requirements_text = requirements_text
 
     issues = check_evaluability(deliverable_text, requirements_text)
 
     if issues:
-        st.error("🔴 Unable to Evaluate")
-        st.write("GradePulse cannot confidently evaluate submission readiness yet.")
-        for issue in issues:
-            st.write(f"- {issue}")
-
+        st.session_state.evaluation_result = {
+            "status": "Unable to Evaluate",
+            "confidence": "Low",
+            "summary": "GradePulse cannot confidently evaluate submission readiness yet. "
+                       + " ".join(issues),
+            "criteria": [],
+            "top_improvements": [],
+        }
     else:
         with st.spinner("Evaluating submission readiness with GitHub Models..."):
-            result = call_github_model(
+            st.session_state.evaluation_result = call_github_model(
                 deliverable_text,
                 requirements_text,
                 target_grade,
-                grading_style
+                grading_style,
             )
 
-        status = result.get("status", "Unable to Evaluate")
-        confidence = result.get("confidence", "Low")
-
-        if status == "Ready to Submit":
-            st.success("🟢 Ready to Submit")
-            st.metric("Confidence", confidence)
-            st.write(result.get("summary", "The assignment appears ready to submit for the selected target."))
-            st.subheader("No revisions recommended.")
-
-        elif status == "Revision Required":
-            st.warning("🟡 Revision Required")
-            st.metric("Target Grade", target_grade)
-            st.metric("Instructor Style", grading_style)
-            st.metric("Confidence", confidence)
-            st.write(result.get("summary", ""))
-
-            st.subheader("Top 3 Improvements")
-            improvements = result.get("top_improvements", [])
-            if improvements:
-                for item in improvements[:3]:
-                    st.write(f"**{item.get('improvement', '')}**")
-                    st.write(f"- Why it matters: {item.get('why_it_matters', '')}")
-
-        else:
-            st.error("🔴 Unable to Evaluate")
-            st.metric("Confidence", confidence)
-            st.write(result.get("summary", "Not enough information to evaluate reliably."))
-
-        with st.expander("Criterion-by-criterion review"):
-            criteria = result.get("criteria", [])
-            if criteria:
-                for criterion in criteria:
-                    st.write(f"**{criterion.get('criterion', '')}**")
-                    st.write(f"- Evidence found: {criterion.get('evidence_found', '')}")
-                    st.write(f"- Assessment: {criterion.get('assessment', '')}")
-                    st.divider()
-            else:
-                st.write("No criterion review was returned.")
+render_results(target_grade, grading_style)
 
 st.divider()
 
